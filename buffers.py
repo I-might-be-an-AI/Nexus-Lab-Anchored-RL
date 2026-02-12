@@ -1,5 +1,10 @@
 """
 Replay buffers: standard uniform replay and rare-event memory bank.
+
+In RL, we store past experience and re-sample it for training. This file
+has two buffers:
+  1. ReplayBuffer     — standard ring buffer, stores everything uniformly
+  2. RareEventBuffer  — small separate store for catastrophic (cost>0) transitions
 """
 
 import random
@@ -10,13 +15,20 @@ from config import BUFFER_SIZE, RARE_BUFFER_SIZE, DEVICE
 
 
 class ReplayBuffer:
-    """Fixed-size ring buffer storing (s, a, r, c, s', done) transitions."""
+    """
+    Standard fixed-size replay buffer using a ring/circular buffer strategy.
+    Stores transitions as (state, action, reward, cost, next_state, done).
+
+    When full, new transitions overwrite the oldest ones (FIFO).
+    Pre-allocates numpy arrays for speed — avoids appending to lists.
+    """
 
     def __init__(self, state_dim: int, action_dim: int, max_size: int = BUFFER_SIZE):
         self.max_size = max_size
-        self.ptr = 0
-        self.size = 0
+        self.ptr = 0       # points to the next slot to write into
+        self.size = 0      # how many valid transitions are stored
 
+        # Pre-allocate arrays — much faster than growing a list
         self.states = np.zeros((max_size, state_dim), dtype=np.float32)
         self.actions = np.zeros((max_size, action_dim), dtype=np.float32)
         self.rewards = np.zeros(max_size, dtype=np.float32)
@@ -25,16 +37,24 @@ class ReplayBuffer:
         self.dones = np.zeros(max_size, dtype=np.float32)
 
     def add(self, state, action, reward, cost, next_state, done):
+        """
+        Store one transition. If buffer is full, overwrites the oldest entry.
+        The pointer wraps around using modulo (ring buffer).
+        """
         self.states[self.ptr] = state
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.costs[self.ptr] = cost
         self.next_states[self.ptr] = next_state
         self.dones[self.ptr] = float(done)
-        self.ptr = (self.ptr + 1) % self.max_size
+        self.ptr = (self.ptr + 1) % self.max_size   # wrap around
         self.size = min(self.size + 1, self.max_size)
 
     def sample(self, batch_size: int):
+        """
+        Uniformly sample a batch of transitions. Returns GPU tensors.
+        This is what SAC uses every gradient step — random past experience.
+        """
         idx = np.random.randint(0, self.size, size=batch_size)
         return (
             torch.FloatTensor(self.states[idx]).to(DEVICE),
@@ -46,7 +66,15 @@ class ReplayBuffer:
         )
 
     def sample_with_idx(self, n: int):
-        """Sample n transitions, also returning their buffer indices."""
+        """
+        Like sample(), but also returns the buffer indices of the sampled
+        transitions. PGR needs these indices to:
+          1. Compute curiosity scores for specific transitions
+          2. Later retrieve those same transitions as flat vectors for
+             diffusion training via get_transitions()
+
+        Uses replace=False so each transition appears at most once.
+        """
         n = min(n, self.size)
         idx = np.random.choice(self.size, n, replace=False)
         return (
@@ -60,7 +88,13 @@ class ReplayBuffer:
         )
 
     def get_transitions(self, idx):
-        """Return flat (s, a, r, c, s') arrays for given indices."""
+        """
+        Return transitions as a single flat numpy array per transition:
+            [s_0, s_1, ..., a_0, a_1, ..., r, c, s'_0, s'_1, ...]
+
+        This flat format is what the diffusion model trains on — it learns
+        to generate entire transition tuples as one vector.
+        """
         return np.concatenate([
             self.states[idx],
             self.actions[idx],
@@ -75,15 +109,30 @@ class ReplayBuffer:
 
 class RareEventBuffer:
     """
-    Small memory bank that retains rare / catastrophic transitions.
-    Currently uses simple FIFO eviction.
+    Small memory bank specifically for catastrophic/hazardous transitions.
+
+    This is our key contribution: PGR's curiosity-based relevance function
+    will eventually stop finding hazard transitions "novel" (because the ICM
+    learns to predict them). When that happens, the diffusion model stops
+    generating hazard-adjacent synthetic data, and the policy "forgets" how
+    to avoid hazards.
+
+    By keeping a dedicated buffer of hazardous transitions and injecting
+    them into diffusion training, we prevent this forgetting.
+
+    Currently uses simple FIFO eviction (oldest out first).
+    TODO: Could be improved with severity-based priority.
     """
 
     def __init__(self, state_dim: int, action_dim: int, max_size: int = RARE_BUFFER_SIZE):
         self.max_size = max_size
-        self.buffer: list[dict] = []
+        self.buffer: list[dict] = []    # list of transition dicts
 
     def add(self, state, action, reward, cost, next_state, done):
+        """
+        Store a hazardous transition. Called by the agent whenever cost > 0.
+        If buffer is full, drops the oldest entry (FIFO).
+        """
         self.buffer.append({
             "state": np.array(state, dtype=np.float32),
             "action": np.array(action, dtype=np.float32),
@@ -93,10 +142,16 @@ class RareEventBuffer:
             "done": float(done),
         })
         if len(self.buffer) > self.max_size:
-            self.buffer.pop(0)
+            self.buffer.pop(0)    # drop oldest
 
     def get_transitions(self, batch_size: int):
-        """Return flat transition arrays for a random subset."""
+        """
+        Sample batch_size transitions and return them as flat vectors,
+        matching the format expected by the diffusion model:
+            [s, a, r, c, s']
+
+        Returns None if the buffer is empty.
+        """
         batch_size = min(batch_size, len(self.buffer))
         if batch_size == 0:
             return None
