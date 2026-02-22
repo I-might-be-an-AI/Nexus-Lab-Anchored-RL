@@ -244,12 +244,18 @@ class SACAgent:
             avg_cost = np.mean(self.recent_costs)
             self.recent_costs = []  # reset
 
-            # Dual gradient step: push λ toward satisfying the constraint
-            # Loss for λ: λ * (avg_cost - COST_LIMIT)
-            # If avg_cost > limit → loss positive → λ should increase
-            # If avg_cost < limit → loss negative → λ should decrease
+            # Dual gradient ASCENT: push λ toward satisfying the constraint
+            # We negate because the optimizer does gradient DESCENT (minimizes),
+            # but for the Lagrange dual we need ASCENT (maximize).
+            #
+            # FIX: Use log_lambda directly, NOT log_lambda.exp().
+            # With .exp(), the gradient = -λ * (cost - limit). When λ gets small,
+            # the gradient vanishes and λ can never recover (death spiral).
+            # Without .exp(), the gradient = -(cost - limit), a constant that
+            # responds immediately regardless of λ's current value.
+            # This matches how SAC tunes its entropy temperature α.
             self.lambda_opt.zero_grad()
-            lambda_loss = self.log_lambda.exp() * (avg_cost - COST_LIMIT)
+            lambda_loss = -self.log_lambda * (avg_cost - COST_LIMIT)
             lambda_loss.backward()
             self.lambda_opt.step()
 
@@ -291,8 +297,11 @@ class SACPGRAgent(SACAgent):
         super().__init__(state_dim, action_dim)
 
         # Transition dimension: the diffusion model generates entire transitions
-        # as flat vectors: [s, a, r, c, s'] all concatenated
-        self.transition_dim = state_dim + action_dim + 1 + 1 + state_dim  # s,a,r,c,s'
+        # as flat vectors: [s, a, r, c, s', d] all concatenated
+        # The done flag is included so the model learns episode boundaries
+        # (without it, synthetic goal transitions get done=False, causing
+        # infinite Q-value loops in the Bellman equation)
+        self.transition_dim = state_dim + action_dim + 1 + 1 + state_dim + 1  # s,a,r,c,s',d
 
         # ── ICM (Intrinsic Curiosity Module) ─────────────────────────────
         # Provides the relevance function F(τ) = prediction error
@@ -312,6 +321,19 @@ class SACPGRAgent(SACAgent):
         self.encoder_opt = optim.Adam(self.encoder.parameters(), lr=LR)
         self.fwd_opt = optim.Adam(self.fwd_model.parameters(), lr=LR)
         self.diff_opt = optim.Adam(self.noise_pred.parameters(), lr=LR)
+
+        # ── Normalization stats for diffusion ─────────────────────────────
+        # Diffusion models assume input features are roughly N(0,1).
+        # But our transitions mix unbounded states, bounded actions [-1,1],
+        # and high-variance rewards — all different scales.
+        # We dynamically track mean/std and standardize before diffusion.
+        self.trans_mean = torch.zeros(self.transition_dim, device=DEVICE)
+        self.trans_std = torch.ones(self.transition_dim, device=DEVICE)
+
+        # Track how many gradient steps the diffusion model has taken.
+        # We don't generate synthetic data until it's had enough training
+        # (burn-in), otherwise we feed garbage to the Q-network.
+        self.diffusion_updates = 0
 
     # ── Curiosity scoring ────────────────────────────────────────────────
 
@@ -364,18 +386,27 @@ class SACPGRAgent(SACAgent):
         learn to generate transitions that look like the real ones with that
         score level."
 
+        FIX: We standardize transitions to ~N(0,1) before feeding to diffusion.
+        Without this, the loss is dominated by high-variance features and the
+        model generates out-of-bounds actions that destroy the Q-function.
+
         Args:
             transitions: (batch, transition_dim) — flat real transition vectors
             scores:      (batch,) — normalized curiosity scores for each
             weights:     (batch,) — optional per-sample loss weights
         """
         x0 = torch.FloatTensor(transitions).to(DEVICE)
+
+        # Standardize to ~N(0,1) so diffusion sees balanced features
+        x0 = (x0 - self.trans_mean) / self.trans_std
+
         rel = torch.FloatTensor(scores[:, None]).to(DEVICE)  # (batch, 1)
         w = torch.FloatTensor(weights).to(DEVICE) if weights is not None else None
 
         self.diff_opt.zero_grad()
         self.diffusion.loss(x0, rel, weights=w).backward()
         self.diff_opt.step()
+        self.diffusion_updates += 1
 
     # ── Synthetic generation ─────────────────────────────────────────────
 
@@ -389,8 +420,11 @@ class SACPGRAgent(SACAgent):
           2. Randomly sample from these top scores + small noise
           3. Use these as the relevance condition for diffusion generation
 
-        This biases generation toward transitions that are novel/surprising,
-        which the paper shows increases diversity and reduces overfitting.
+        Post-processing fixes applied:
+          - Un-standardize back to physical env bounds
+          - Clamp actions to [-1,1] (prevents Q-function extrapolation)
+          - Binarize cost at 0.5 (prevents micro-cost minefield effect)
+          - Binarize done at 0.5 (prevents infinite Bellman loops)
 
         Returns: tuple of (states, actions, rewards, costs, next_states, dones)
                  all as GPU tensors
@@ -411,14 +445,23 @@ class SACPGRAgent(SACAgent):
             torch.FloatTensor(conds[:, None]).to(DEVICE),
         )
 
+        # Un-standardize: convert back from N(0,1) to physical environment scale
+        syn = syn * self.trans_std + self.trans_mean
+
         # Slice the flat vector back into individual components
-        # Layout: [s (state_dim) | a (action_dim) | r (1) | c (1) | s' (state_dim)]
+        # Layout: [s (state_dim) | a (action_dim) | r (1) | c (1) | s' (state_dim) | d (1)]
         syn_s  = syn[:, :self.state_dim]
-        syn_a  = syn[:, self.state_dim : self.state_dim + self.action_dim]
+        # Clamp actions to [-1,1] — prevents Q-function extrapolation catastrophe
+        syn_a  = torch.clamp(syn[:, self.state_dim : self.state_dim + self.action_dim], -1.0, 1.0)
         syn_r  = syn[:, self.state_dim + self.action_dim]
-        syn_c  = syn[:, self.state_dim + self.action_dim + 1]
-        syn_ns = syn[:, self.state_dim + self.action_dim + 2:]
-        syn_d  = torch.zeros(n_syn, device=DEVICE)  # assume not terminal
+        # Binarize cost: diffusion outputs continuous values, but cost is 0 or 1.
+        # Without this, micro-costs like 0.05 make the agent think everywhere is dangerous.
+        syn_c  = (syn[:, self.state_dim + self.action_dim + 1] > 0.5).float()
+        syn_ns = syn[:, self.state_dim + self.action_dim + 2 : -1]
+        # Binarize done: the diffusion model learned when episodes end.
+        # Without this, goal transitions get done=False → Q-function thinks
+        # it can collect +10 reward infinitely → Q-values explode.
+        syn_d  = (syn[:, -1] > 0.5).float()
 
         return syn_s, syn_a, syn_r, syn_c, syn_ns, syn_d
 
@@ -454,6 +497,20 @@ class SACPGRAgent(SACAgent):
             # Compute and normalize curiosity for the pool
             scores_np = normalize_scores(self._compute_curiosity(s, a, ns).cpu().numpy())
 
+            # Update normalization stats from the current pool
+            # This keeps the diffusion model seeing standardized ~N(0,1) data
+            pool_trans = self.buffer.get_transitions(idx)
+            self.trans_mean = torch.FloatTensor(pool_trans.mean(axis=0)).to(DEVICE)
+            # Clamp std to at least 0.01 to prevent normalization explosion.
+            # When cost is 0 everywhere (agent learned safety), std → 0,
+            # so a single cost=1 from rare buffer becomes 1/1e-8 = 100 million.
+            # Also hardcode binary features (cost, done) to std=1.0 to preserve scale.
+            std = np.maximum(pool_trans.std(axis=0), 1e-2)
+            cost_idx = self.state_dim + self.action_dim + 1
+            std[cost_idx] = 1.0   # cost is binary 0/1, don't normalize
+            std[-1] = 1.0         # done is binary 0/1, don't normalize
+            self.trans_std = torch.FloatTensor(std).to(DEVICE)
+
             # Train ICM to get better at prediction (makes curiosity more accurate)
             self._train_icm()
 
@@ -466,19 +523,26 @@ class SACPGRAgent(SACAgent):
             )
 
             # ── Phase 2: Generate synthetic data and mix ─────────────
-            n_syn = int(BATCH_SIZE * REPLAY_RATIO)  # e.g. 30% of batch
-            syn_s, syn_a, syn_r, syn_c, syn_ns, syn_d = self._generate_synthetic(n_syn, scores_np)
+            # Only generate after enough diffusion training (burn-in).
+            # Before this, the diffusion model outputs near-random garbage
+            # that poisons the Q-network during critical early exploration.
+            diffusion_ready = self.diffusion_updates > 2000
+            n_syn = int(BATCH_SIZE * REPLAY_RATIO) if diffusion_ready else 0
 
-            # Fill the rest of the batch with real data
-            real_s, real_a, real_r, real_c, real_ns, real_d = self.buffer.sample(BATCH_SIZE - n_syn)
-
-            # Concatenate real + synthetic
-            states      = torch.cat([real_s, syn_s])
-            actions     = torch.cat([real_a, syn_a])
-            rewards     = torch.cat([real_r, syn_r])
-            costs       = torch.cat([real_c, syn_c])
-            next_states = torch.cat([real_ns, syn_ns])
-            dones       = torch.cat([real_d, syn_d])
+            if n_syn > 0:
+                syn_s, syn_a, syn_r, syn_c, syn_ns, syn_d = self._generate_synthetic(n_syn, scores_np)
+                # Fill the rest of the batch with real data
+                real_s, real_a, real_r, real_c, real_ns, real_d = self.buffer.sample(BATCH_SIZE - n_syn)
+                # Concatenate real + synthetic
+                states      = torch.cat([real_s, syn_s])
+                actions     = torch.cat([real_a, syn_a])
+                rewards     = torch.cat([real_r, syn_r])
+                costs       = torch.cat([real_c, syn_c])
+                next_states = torch.cat([real_ns, syn_ns])
+                dones       = torch.cat([real_d, syn_d])
+            else:
+                # Diffusion not ready yet — train on real data only
+                states, actions, rewards, costs, next_states, dones = self.buffer.sample(BATCH_SIZE)
         else:
             # Before PGR kicks in, just train on real data (same as vanilla SAC)
             states, actions, rewards, costs, next_states, dones = self.buffer.sample(BATCH_SIZE)
@@ -520,17 +584,21 @@ class SACPGRMemoryAgent(SACPGRAgent):
 
     def train_step(self):
         """
-        Same as PGR train_step, but with one key difference:
-        when training the diffusion model, we MIX in rare-event transitions
-        with higher loss weights.
+        PGR+Memory training: rare events injected at TWO levels.
 
-        The diffusion training batch becomes:
-          - 80% normal transitions from the main buffer (weight = 1.0)
-          - 20% catastrophic transitions from rare buffer (weight = 5.0)
+        Level 1 — Diffusion training (same as before):
+          80% normal buffer + 20% rare buffer with 5x loss weight.
+          Forces the diffusion model to remember hazard transitions.
 
-        This forces the diffusion model to learn the structure of hazardous
-        transitions 5x more thoroughly than normal ones, preventing the
-        "curiosity decay → forgetting" problem.
+        Level 2 — SAC policy training (NEW — Fix 3):
+          The SAC batch is split three ways: real + synthetic + rare.
+          This guarantees the policy sees actual hazard data every batch,
+          bypassing the diffusion quality bottleneck entirely.
+
+        The batch composition:
+          - n_real = BATCH_SIZE - n_syn - n_rare  (roughly 50%)
+          - n_syn  = BATCH_SIZE * REPLAY_RATIO    (30% synthetic)
+          - n_rare = BATCH_SIZE * RARE_BATCH_RATIO (20% rare)
         """
         if len(self.buffer) < BATCH_SIZE:
             return
@@ -544,12 +612,22 @@ class SACPGRMemoryAgent(SACPGRAgent):
             )
             scores_np = normalize_scores(self._compute_curiosity(s, a, ns).cpu().numpy())
 
+            # Update normalization stats from the current pool
+            # Bug 2 fix: clamp std and hardcode binary features
+            pool_trans = self.buffer.get_transitions(idx)
+            self.trans_mean = torch.FloatTensor(pool_trans.mean(axis=0)).to(DEVICE)
+            std = np.maximum(pool_trans.std(axis=0), 1e-2)
+            cost_idx = self.state_dim + self.action_dim + 1
+            std[cost_idx] = 1.0   # cost is binary, don't normalize
+            std[-1] = 1.0         # done is binary, don't normalize
+            self.trans_std = torch.FloatTensor(std).to(DEVICE)
+
             # Train ICM
             self._train_icm()
 
-            # ── KEY DIFFERENCE: diffusion training with rare-event injection ──
-            n_rare = int(BATCH_SIZE * RARE_BATCH_RATIO)    # 20% rare
-            n_normal = BATCH_SIZE - n_rare                  # 80% normal
+            # ── Level 1: Diffusion training with rare-event injection ────
+            n_rare_diff = int(BATCH_SIZE * RARE_BATCH_RATIO)    # 20% rare
+            n_normal = BATCH_SIZE - n_rare_diff                  # 80% normal
 
             # Normal transitions from main buffer
             batch_idx = np.random.choice(len(idx), n_normal, replace=True)
@@ -559,17 +637,12 @@ class SACPGRMemoryAgent(SACPGRAgent):
 
             # Inject rare transitions if available
             if len(self.rare_buffer) > 0:
-                rare_trans = self.rare_buffer.get_transitions(min(n_rare, len(self.rare_buffer)))
+                rare_trans = self.rare_buffer.get_transitions(min(n_rare_diff, len(self.rare_buffer)))
                 if rare_trans is not None:
-                    # Give rare transitions artificially HIGH relevance scores
-                    # so the diffusion model associates them with high-priority
-                    rare_scores = np.ones(len(rare_trans)) * scores_np.max() * 2
-
-                    # Upweight their loss contribution — forces the model to
-                    # learn these transitions more thoroughly
+                    # Bug 5 fix: use scores_np.max() NOT * 2
+                    # With * 2, hazards are mapped to unreachable prompt scores
+                    rare_scores = np.ones(len(rare_trans)) * scores_np.max()
                     rare_weights = np.ones(len(rare_trans)) * RARE_WEIGHT
-
-                    # Combine normal + rare into one batch
                     all_trans = np.vstack([normal_trans, rare_trans])
                     all_scores = np.concatenate([normal_scores, rare_scores])
                     all_weights = np.concatenate([normal_weights, rare_weights])
@@ -578,24 +651,53 @@ class SACPGRMemoryAgent(SACPGRAgent):
             else:
                 all_trans, all_scores, all_weights = normal_trans, normal_scores, normal_weights
 
-            # Normalize weights so they average to 1.0
-            # (otherwise total loss magnitude changes with rare buffer size)
             all_weights = all_weights / all_weights.mean()
-
-            # Train diffusion on this mixed batch
             self._train_diffusion(all_trans, all_scores, all_weights)
 
-            # ── Generate and mix (same as base PGR) ──────────────────────
-            n_syn = int(BATCH_SIZE * REPLAY_RATIO)
-            syn_s, syn_a, syn_r, syn_c, syn_ns, syn_d = self._generate_synthetic(n_syn, scores_np)
+            # ── Level 2: SAC batch = real + synthetic + rare ─────────────
+            # Bug 4 fix: only generate synthetic after 2000 diffusion updates
+            diffusion_ready = self.diffusion_updates > 2000
+            n_syn = int(BATCH_SIZE * REPLAY_RATIO) if diffusion_ready else 0
+            n_rare_sac = int(BATCH_SIZE * RARE_BATCH_RATIO) if len(self.rare_buffer) > 0 else 0
+            n_real = BATCH_SIZE - n_syn - n_rare_sac
 
-            real_s, real_a, real_r, real_c, real_ns, real_d = self.buffer.sample(BATCH_SIZE - n_syn)
-            states      = torch.cat([real_s, syn_s])
-            actions     = torch.cat([real_a, syn_a])
-            rewards     = torch.cat([real_r, syn_r])
-            costs       = torch.cat([real_c, syn_c])
-            next_states = torch.cat([real_ns, syn_ns])
-            dones       = torch.cat([real_d, syn_d])
+            real_s, real_a, real_r, real_c, real_ns, real_d = self.buffer.sample(n_real)
+
+            # Start building the batch components
+            parts_s  = [real_s]
+            parts_a  = [real_a]
+            parts_r  = [real_r]
+            parts_c  = [real_c]
+            parts_ns = [real_ns]
+            parts_d  = [real_d]
+
+            if n_syn > 0:
+                syn_s, syn_a, syn_r, syn_c, syn_ns, syn_d = self._generate_synthetic(n_syn, scores_np)
+                parts_s.append(syn_s)
+                parts_a.append(syn_a)
+                parts_r.append(syn_r)
+                parts_c.append(syn_c)
+                parts_ns.append(syn_ns)
+                parts_d.append(syn_d)
+
+            # Inject rare transitions directly into SAC batch
+            if n_rare_sac > 0:
+                rare_sample = self.rare_buffer.sample(n_rare_sac)
+                if rare_sample is not None:
+                    rs, ra, rr, rc, rns, rd = rare_sample
+                    parts_s.append(rs)
+                    parts_a.append(ra)
+                    parts_r.append(rr)
+                    parts_c.append(rc)
+                    parts_ns.append(rns)
+                    parts_d.append(rd)
+
+            states      = torch.cat(parts_s)
+            actions     = torch.cat(parts_a)
+            rewards     = torch.cat(parts_r)
+            costs       = torch.cat(parts_c)
+            next_states = torch.cat(parts_ns)
+            dones       = torch.cat(parts_d)
         else:
             states, actions, rewards, costs, next_states, dones = self.buffer.sample(BATCH_SIZE)
 

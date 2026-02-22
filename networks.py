@@ -330,7 +330,10 @@ class Diffusion:
 
         # Pre-compute the noise schedule (linear beta schedule)
         # betas go from small (barely any noise) to larger (more noise)
-        betas = torch.linspace(1e-4, 0.02, T, device=DEVICE)
+        # max_beta=0.1 ensures alpha_bar reaches ~0.0 at step T,
+        # matching the pure Gaussian noise we start from during generation.
+        # (Old max_beta=0.02 left alpha_bar at ~0.90 = still 90% clean = garbage generation)
+        betas = torch.linspace(1e-4, 0.1, T, device=DEVICE)
         alphas = 1 - betas                           # α_t = 1 - β_t
         alpha_bar = torch.cumprod(alphas, 0)         # ᾱ_t = Π α_i (cumulative product)
 

@@ -90,10 +90,12 @@ class ReplayBuffer:
     def get_transitions(self, idx):
         """
         Return transitions as a single flat numpy array per transition:
-            [s_0, s_1, ..., a_0, a_1, ..., r, c, s'_0, s'_1, ...]
+            [s, a, r, c, s', d]
 
         This flat format is what the diffusion model trains on — it learns
         to generate entire transition tuples as one vector.
+        The done flag is included so the diffusion model learns when episodes
+        end (critical for correct Bellman targets on synthetic data).
         """
         return np.concatenate([
             self.states[idx],
@@ -101,6 +103,7 @@ class ReplayBuffer:
             self.rewards[idx].reshape(-1, 1),
             self.costs[idx].reshape(-1, 1),
             self.next_states[idx],
+            self.dones[idx].reshape(-1, 1),
         ], axis=-1)
 
     def __len__(self):
@@ -148,7 +151,7 @@ class RareEventBuffer:
         """
         Sample batch_size transitions and return them as flat vectors,
         matching the format expected by the diffusion model:
-            [s, a, r, c, s']
+            [s, a, r, c, s', d]
 
         Returns None if the buffer is empty.
         """
@@ -158,10 +161,35 @@ class RareEventBuffer:
         batch = random.sample(self.buffer, batch_size)
         return np.stack([
             np.concatenate([
-                t["state"], t["action"], [t["reward"]], [t["cost"]], t["next_state"]
+                t["state"], t["action"], [t["reward"]], [t["cost"]], t["next_state"], [t["done"]]
             ])
             for t in batch
         ])
+
+    def sample(self, batch_size: int):
+        """
+        Sample batch_size transitions as GPU tensors for direct SAC updates.
+
+        This is Fix 3: instead of only injecting rare events into diffusion
+        training, we also inject them directly into the SAC policy batch.
+        This bypasses the diffusion quality bottleneck — the policy gets
+        REAL hazard data every gradient step, guaranteed.
+
+        Returns: (states, actions, rewards, costs, next_states, dones) as GPU tensors,
+                 or None if buffer is empty.
+        """
+        batch_size = min(batch_size, len(self.buffer))
+        if batch_size == 0:
+            return None
+        batch = random.sample(self.buffer, batch_size)
+        return (
+            torch.FloatTensor(np.stack([t["state"] for t in batch])).to(DEVICE),
+            torch.FloatTensor(np.stack([t["action"] for t in batch])).to(DEVICE),
+            torch.FloatTensor(np.array([t["reward"] for t in batch], dtype=np.float32)).to(DEVICE),
+            torch.FloatTensor(np.array([t["cost"] for t in batch], dtype=np.float32)).to(DEVICE),
+            torch.FloatTensor(np.stack([t["next_state"] for t in batch])).to(DEVICE),
+            torch.FloatTensor(np.array([t["done"] for t in batch], dtype=np.float32)).to(DEVICE),
+        )
 
     def __len__(self):
         return len(self.buffer)

@@ -26,8 +26,12 @@ BATCH_SIZE = 128        # transitions per gradient step
 BUFFER_SIZE = 30_000    # max transitions stored in the main replay buffer
 
 # ── PGR / Diffusion ─────────────────────────────────────────────────────────
-DIFFUSION_STEPS = 10    # number of denoising steps T (fewer = faster generation,
-                        # but lower quality; 10 is fine for low-dim data)
+DIFFUSION_STEPS = 50    # number of denoising steps T
+                        # With T=10 and max_beta=0.02, alpha_bar only reaches 0.90
+                        # meaning data is still 90% clean at the "noisiest" step.
+                        # But generation starts from pure noise (alpha_bar=0)!
+                        # T=50 with max_beta=0.1 lets alpha_bar reach ~0.0,
+                        # matching the generation starting point.
 LATENT_DIM = 32         # dimensionality of the ICM latent space
 REPLAY_RATIO = 0.3      # fraction of each training batch that is synthetic
                         # (0.3 = 30% generated, 70% real transitions)
@@ -68,7 +72,7 @@ RARE_WEIGHT = 5.0         # loss weight multiplier — rare transitions contribu
 # expected cost per episode staying below COST_LIMIT.
 COST_LIMIT = 2.0           # target max cost per episode (2 hazard hits)
                             # agents must learn to hit ≤2 hazards per episode
-LAMBDA_LR = 5e-3           # learning rate for the Lagrange multiplier
+LAMBDA_LR = 1e-2            # learning rate for the Lagrange multiplier
                             # higher = faster adaptation but can oscillate
-LAMBDA_INIT = 1.0           # initial penalty strength — start with moderate penalty
-                            # so agents avoid hazards from early on
+LAMBDA_INIT = 5.0           # initial penalty strength — start aggressive so
+                            # agents learn hazard avoidance from early training
